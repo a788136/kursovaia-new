@@ -580,7 +580,7 @@ router.get('/inventories/:id/discussion', async (req, res, next) => {
       }
     ];
 
-    // Коллекция для обсуждений: 'discussionposts'
+    // Коллекция обсуждений: 'discussionposts'
     const posts = await db().collection('discussionposts').aggregate(pipeline).toArray();
     const items = posts.map(p => ({
       id: String(p._id),
@@ -633,7 +633,7 @@ router.post('/inventories/:id/discussion', requireAuth, async (req, res, next) =
       },
     };
 
-    // Realtime: если Socket.IO подключён и передан в app — отправим событие комнате инвентаря
+    // Realtime (если подключён Socket.IO)
     const io = req.app.get('io');
     if (io) {
       io.to(`inv:${String(id)}`).emit('discussion:new', payload);
