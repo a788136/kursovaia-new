@@ -25,6 +25,16 @@ function canEdit(user, doc) {
   if (user.isAdmin || user.role === 'admin') return true;
   return String(doc.owner_id) === String(user._id);
 }
+function isAdmin(user) {
+  return !!(user && (user.isAdmin || user.role === 'admin'));
+}
+function requireAdmin(req, res, next) {
+  return requireAuth(req, res, (err) => {
+    if (err) return next(err);
+    if (!isAdmin(req.user)) return res.status(403).json({ error: 'Forbidden' });
+    return next();
+  });
+}
 
 // Нормализованный ответ для списка (AllInventories)
 function toClientLite(inv) {
@@ -640,6 +650,308 @@ router.post('/inventories/:id/discussion', requireAuth, async (req, res, next) =
     }
 
     res.status(201).json(payload);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ======================================================================
+   SHAG 9: ACCESS MANAGEMENT (инвентарь ↔ пользователи)
+   ====================================================================== */
+
+/**
+ * Коллекция: inventoryaccesses
+ * Документ: { _id, inventoryId:ObjectId, userId:ObjectId, accessType:'read'|'write', createdAt }
+ * Индекс (рекомендуется): { inventoryId:1, userId:1 } unique
+ */
+
+/**
+ * GET /inventories/:id/access
+ * Только владелец инвентаря или админ.
+ * Возвращает: { owner: {id,name,email,avatar}, items: [{ user:{id,name,email,avatar,blocked}, accessType }] }
+ */
+router.get('/inventories/:id/access', requireAuth, async (req, res, next) => {
+  try {
+    const invId = toObjectId(req.params.id);
+    if (!invId) return res.status(400).json({ error: 'Invalid id' });
+
+    const inv = await db().collection('inventories').findOne({ _id: invId });
+    if (!inv) return res.status(404).json({ error: 'Not found' });
+    if (!canEdit(req.user, inv)) return res.status(403).json({ error: 'Forbidden' });
+
+    const ownerUser = await db().collection('users').findOne({ _id: inv.owner_id });
+    const owner = ownerUser ? {
+      id: String(ownerUser._id),
+      name: ownerUser.name || '',
+      email: ownerUser.email || '',
+      avatar: ownerUser.avatar || '',
+      blocked: !!ownerUser.blocked
+    } : null;
+
+    const pipeline = [
+      { $match: { inventoryId: invId } },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'userId',
+          foreignField: '_id',
+          as: 'user'
+        }
+      },
+      { $unwind: '$user' },
+      {
+        $project: {
+          _id: 0,
+          accessType: 1,
+          user: {
+            id: '$user._id',
+            name: '$user.name',
+            email: '$user.email',
+            avatar: '$user.avatar',
+            blocked: '$user.blocked'
+          }
+        }
+      }
+    ];
+
+    const rows = await db().collection('inventoryaccesses').aggregate(pipeline).toArray();
+    const items = rows.map(r => ({
+      accessType: r.accessType,
+      user: {
+        id: String(r.user.id),
+        name: r.user.name || '',
+        email: r.user.email || '',
+        avatar: r.user.avatar || '',
+        blocked: !!r.user.blocked
+      }
+    }));
+
+    res.json({ owner, items });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PUT /inventories/:id/access
+ * Только владелец или админ.
+ * Body:
+ * {
+ *   "changes": [ { "userId": "<id>|null", "email":"<email>|null", "accessType": "read"|"write"|null } ],
+ *   "remove": ["<userId>", ...]
+ * }
+ * - Если accessType=null => удалить доступ этому пользователю (как remove)
+ * - Нельзя менять доступ владельцу.
+ * Ответ: такой же, как GET /inventories/:id/access
+ */
+router.put('/inventories/:id/access', requireAuth, async (req, res, next) => {
+  try {
+    const invId = toObjectId(req.params.id);
+    if (!invId) return res.status(400).json({ error: 'Invalid id' });
+
+    const inv = await db().collection('inventories').findOne({ _id: invId });
+    if (!inv) return res.status(404).json({ error: 'Not found' });
+    if (!canEdit(req.user, inv)) return res.status(403).json({ error: 'Forbidden' });
+
+    // Обрабатываем изменения
+    const changes = Array.isArray(req.body?.changes) ? req.body.changes : [];
+    const remove = Array.isArray(req.body?.remove) ? req.body.remove : [];
+
+    // подготовим индекс уникальности (мягко)
+    try {
+      await db().collection('inventoryaccesses').createIndex({ inventoryId: 1, userId: 1 }, { unique: true });
+    } catch { /* ignore */ }
+
+    // helper: ищем юзера по id/email
+    async function resolveUserId(entry) {
+      if (entry.userId && mongoose.isValidObjectId(entry.userId)) return new mongoose.Types.ObjectId(entry.userId);
+      if (entry.email) {
+        const u = await db().collection('users').findOne({ email: String(entry.email).trim().toLowerCase() });
+        return u?._id || null;
+      }
+      return null;
+    }
+
+    // 1) remove
+    const toRemoveIds = [];
+    for (const rid of remove) {
+      if (!mongoose.isValidObjectId(rid)) continue;
+      const oid = new mongoose.Types.ObjectId(rid);
+      if (String(oid) === String(inv.owner_id)) continue; // нельзя убирать владельца
+      toRemoveIds.push(oid);
+    }
+    if (toRemoveIds.length) {
+      await db().collection('inventoryaccesses').deleteMany({ inventoryId: invId, userId: { $in: toRemoveIds } });
+    }
+
+    // 2) changes (upsert / unset)
+    for (const ch of changes) {
+      const uid = await resolveUserId(ch);
+      if (!uid) continue;
+      if (String(uid) === String(inv.owner_id)) continue; // владельца не трогаем
+
+      if (!ch.accessType) {
+        await db().collection('inventoryaccesses').deleteOne({ inventoryId: invId, userId: uid });
+        continue;
+      }
+      const accessType = ch.accessType === 'write' ? 'write' : 'read';
+      await db().collection('inventoryaccesses').updateOne(
+        { inventoryId: invId, userId: uid },
+        { $set: { inventoryId: invId, userId: uid, accessType, createdAt: new Date() } },
+        { upsert: true }
+      );
+    }
+
+    // Возврат — как GET
+    req.params.id = String(invId);
+    return router.handle({ ...req, method: 'GET', url: `/inventories/${invId}/access` }, res, next);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ======================================================================
+   USERS SEARCH (для автокомплита в AccessTab)
+   ====================================================================== */
+
+/**
+ * GET /users/search?q=term&limit=10
+ * Требует авторизации. Ищем по email|name (регистронезависимо).
+ * Возвращаем: [{ id,name,email,avatar,blocked }]
+ */
+router.get('/users/search', requireAuth, async (req, res, next) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const lim = Math.min(parseInt(req.query.limit, 10) || 10, 50);
+    if (!q) return res.json([]);
+
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+
+    const users = await db().collection('users')
+      .find({ $or: [{ email: rx }, { name: rx }] }, { projection: { name: 1, email: 1, avatar: 1, blocked: 1 } })
+      .limit(lim)
+      .toArray();
+
+    const items = users.map(u => ({
+      id: String(u._id),
+      name: u.name || '',
+      email: u.email || '',
+      avatar: u.avatar || '',
+      blocked: !!u.blocked
+    }));
+    res.json(items);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ======================================================================
+   ADMIN: список пользователей, блокировка, роль админа
+   ====================================================================== */
+
+/**
+ * GET /admin/users?q=&page=&limit=
+ * Только админ
+ */
+router.get('/admin/users', requireAdmin, async (req, res, next) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const lim = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const pg = Math.max(parseInt(req.query.page, 10) || 1, 1);
+
+    const filter = {};
+    if (q) {
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [{ email: rx }, { name: rx }];
+    }
+
+    const cursor = db().collection('users')
+      .find(filter, { projection: { name: 1, email: 1, avatar: 1, blocked: 1, role: 1, isAdmin: 1, createdAt: 1 } })
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((pg - 1) * lim)
+      .limit(lim);
+
+    const [rows, total] = await Promise.all([
+      cursor.toArray(),
+      db().collection('users').countDocuments(filter)
+    ]);
+
+    const items = rows.map(u => ({
+      id: String(u._id),
+      name: u.name || '',
+      email: u.email || '',
+      avatar: u.avatar || '',
+      blocked: !!u.blocked,
+      isAdmin: !!(u.isAdmin || u.role === 'admin'),
+      role: u.role || (u.isAdmin ? 'admin' : 'user'),
+      createdAt: u.createdAt || null
+    }));
+
+    res.json({ items, total, page: pg, limit: lim });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /admin/users/:id/block { blocked: true|false }
+ * Только админ
+ */
+router.patch('/admin/users/:id/block', requireAdmin, async (req, res, next) => {
+  try {
+    const uid = toObjectId(req.params.id);
+    if (!uid) return res.status(400).json({ error: 'Invalid id' });
+
+    const blocked = !!req.body?.blocked;
+    await db().collection('users').updateOne({ _id: uid }, { $set: { blocked } });
+
+    const u = await db().collection('users').findOne({ _id: uid }, { projection: { name: 1, email: 1, avatar: 1, blocked: 1, role: 1, isAdmin: 1 } });
+    res.json({
+      id: String(u._id),
+      name: u.name || '',
+      email: u.email || '',
+      avatar: u.avatar || '',
+      blocked: !!u.blocked,
+      isAdmin: !!(u.isAdmin || u.role === 'admin'),
+      role: u.role || (u.isAdmin ? 'admin' : 'user')
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /admin/users/:id/admin { isAdmin: true|false }
+ * Только админ
+ */
+router.patch('/admin/users/:id/admin', requireAdmin, async (req, res, next) => {
+  try {
+    const uid = toObjectId(req.params.id);
+    if (!uid) return res.status(400).json({ error: 'Invalid id' });
+
+    const isAdminNext = !!req.body?.isAdmin;
+
+    const $set = { isAdmin: isAdminNext };
+    // синхронизируем role для совместимости с canEdit()
+    if (isAdminNext) $set.role = 'admin';
+    else {
+      // если сейчас role === admin — опускаем до user
+      const cur = await db().collection('users').findOne({ _id: uid }, { projection: { role: 1 } });
+      if (cur?.role === 'admin') $set.role = 'user';
+    }
+
+    await db().collection('users').updateOne({ _id: uid }, { $set });
+
+    const u = await db().collection('users').findOne({ _id: uid }, { projection: { name: 1, email: 1, avatar: 1, blocked: 1, role: 1, isAdmin: 1 } });
+    res.json({
+      id: String(u._id),
+      name: u.name || '',
+      email: u.email || '',
+      avatar: u.avatar || '',
+      blocked: !!u.blocked,
+      isAdmin: !!(u.isAdmin || u.role === 'admin'),
+      role: u.role || (u.isAdmin ? 'admin' : 'user')
+    });
   } catch (err) {
     next(err);
   }
