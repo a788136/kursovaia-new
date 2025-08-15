@@ -1,54 +1,95 @@
+// src/controllers/likeController.js
+import mongoose from 'mongoose';
 import Like from '../models/Like.js';
-import Item from '../models/Item.js'; // default export из твоего Item.js
+import Item from '../models/Item.js';
+
+/**
+ * Безопасно получить строковый userId из разных мест:
+ * - req.user (устанавливается requireAuth)
+ * - req.jwt.sub (устанавливается attachUser)
+ */
+function getUserId(req) {
+  const fromUser = req.user && (req.user._id || req.user.id);
+  if (fromUser) return String(fromUser);
+  const sub = req.jwt && (req.jwt.sub || req.jwt.userId || req.jwt.id || req.jwt._id);
+  return sub ? String(sub) : null;
+}
 
 // GET /items/:itemId/likes
 export async function getLikes(req, res, next) {
   try {
     const { itemId } = req.params;
 
-    const item = await Item.findById(itemId).select('_id').lean();
-    if (!item) return res.status(404).json({ error: 'Item not found' });
+    if (!mongoose.isValidObjectId(itemId)) {
+      return res.status(400).json({ error: 'Invalid itemId' });
+    }
+
+    const exists = await Item.exists({ _id: itemId });
+    if (!exists) return res.status(404).json({ error: 'Item not found' });
 
     const [count, liked] = await Promise.all([
       Like.countDocuments({ item: itemId }),
-      req.user
-        ? Like.exists({ item: itemId, user: req.user._id }).then(Boolean)
-        : false,
+      (async () => {
+        const userId = getUserId(req);
+        if (!userId) return false;
+        const ex = await Like.exists({ item: itemId, user: userId });
+        return Boolean(ex);
+      })(),
     ]);
 
-    res.json({ count, liked });
-  } catch (e) { next(e); }
+    return res.json({ count, liked });
+  } catch (e) {
+    return next(e);
+  }
 }
 
 // POST /items/:itemId/like
 export async function like(req, res, next) {
   try {
     const { itemId } = req.params;
-    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const item = await Item.findById(itemId).select('_id').lean();
-    if (!item) return res.status(404).json({ error: 'Item not found' });
+    if (!mongoose.isValidObjectId(itemId)) {
+      return res.status(400).json({ error: 'Invalid itemId' });
+    }
 
-    // upsert — гарантирует идемпотентность
+    const exists = await Item.exists({ _id: itemId });
+    if (!exists) return res.status(404).json({ error: 'Item not found' });
+
+    // upsert лайка (без ошибки на повтор)
     await Like.updateOne(
-      { item: itemId, user: req.user._id },
-      { $setOnInsert: { item: itemId, user: req.user._id, created_at: new Date() } },
+      { item: itemId, user: userId },
+      { $setOnInsert: { created_at: new Date() } },
       { upsert: true }
     );
 
     const count = await Like.countDocuments({ item: itemId });
-    res.status(200).json({ ok: true, count, liked: true });
-  } catch (e) { next(e); }
+    return res.json({ ok: true, count, liked: true });
+  } catch (e) {
+    return next(e);
+  }
 }
 
 // DELETE /items/:itemId/like
 export async function unlike(req, res, next) {
   try {
     const { itemId } = req.params;
-    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    await Like.deleteOne({ item: itemId, user: req.user._id });
+    if (!mongoose.isValidObjectId(itemId)) {
+      return res.status(400).json({ error: 'Invalid itemId' });
+    }
+
+    const exists = await Item.exists({ _id: itemId });
+    if (!exists) return res.status(404).json({ error: 'Item not found' });
+
+    await Like.deleteOne({ item: itemId, user: userId });
+
     const count = await Like.countDocuments({ item: itemId });
-    res.status(200).json({ ok: true, count, liked: false });
-  } catch (e) { next(e); }
+    return res.json({ ok: true, count, liked: false });
+  } catch (e) {
+    return next(e);
+  }
 }
