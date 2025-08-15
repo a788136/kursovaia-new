@@ -542,7 +542,7 @@ router.put('/inventories/:id/customIdFormat', requireAuth, async (req, res, next
 
 /**
  * GET /inventories/:id/discussion
- * Public: список сообщений (ASC по времени).
+ * Публично. Список сообщений по времени (ASC).
  * Query:
  *   - limit: number (default 200, max 500)
  *   - after: ISO date string (optional) — только сообщения с createdAt > after

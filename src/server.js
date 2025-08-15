@@ -5,24 +5,21 @@ import { Server } from 'socket.io';
 
 const { PORT } = loadEnv();
 
-// Create HTTP server and attach Socket.IO
+// Создаём HTTP сервер и вешаем Socket.IO
 const server = http.createServer(app);
-
-// Разрешаем origin по умолчанию (для чтения realtime сообщений).
-// Для ужесточения можно ограничить origin по CLIENT_ORIGINS.
 const io = new Server(server, {
   cors: {
-    origin: true, // отражает origin запроса
+    origin: true, // отражает запрашивающий origin
     credentials: false,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   },
   path: '/socket.io',
 });
 
-// Делаем io доступным внутри роутов: req.app.get('io')
+// Делаем io доступным в роутерах (req.app.get('io'))
 app.set('io', io);
 
-// Простая схема комнат: join/leave по инвентарю
+// Простая авторизация по "комнатам" по inventoryId
 io.on('connection', (socket) => {
   socket.on('join', ({ inventoryId }) => {
     if (!inventoryId) return;
