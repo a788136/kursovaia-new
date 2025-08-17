@@ -35,6 +35,26 @@ function requireAdmin(req, res, next) {
     return next();
   });
 }
+async function hasWriteAccess(userId, invId) {
+  if (!userId || !invId) return false;
+  const row = await db().collection('inventoryaccesses').findOne({
+    inventoryId: invId,
+    userId: userId,
+    accessType: 'write',
+  });
+  return !!row;
+}
+async function canWriteInventory(user, invDocOrId) {
+  if (!user) return false;
+  if (isAdmin(user)) return true;
+  const invId = invDocOrId?._id ? invDocOrId._id : invDocOrId;
+  const id = invId && toObjectId(invId);
+  if (!id) return false;
+  const inv = invDocOrId?._id ? invDocOrId : await db().collection('inventories').findOne({ _id: id }, { projection: { owner_id: 1 } });
+  if (!inv) return false;
+  if (String(inv.owner_id) === String(user._id)) return true;
+  return hasWriteAccess(toObjectId(user._id) ?? user._id, id);
+}
 
 // Нормализованный ответ для списка (AllInventories)
 function toClientLite(inv) {
@@ -104,19 +124,6 @@ function validateFieldsArray(fields) {
   }
   return null;
 }
-/**
- * customIdFormat пример:
- * {
- *   "enabled": true,
- *   "separator": "-",
- *   "elements": [
- *     { "type": "text", "value": "INV" },
- *     { "type": "date", "format": "YYYYMM" },
- *     { "type": "field", "key": "brand" },
- *     { "type": "seq", "pad": 4, "scope": "inventory" } // "global"|"inventory"
- *   ]
- * }
- */
 function validateCustomIdFormat(cfg) {
   if (cfg == null) return null; // разрешаем null
   if (typeof cfg !== 'object') return 'customIdFormat must be an object';
@@ -153,9 +160,6 @@ function validateCustomIdFormat(cfg) {
    PUBLIC: HomePage endpoints
    ====================================================================== */
 
-/**
- * GET /inventories/latest?limit=10
- */
 router.get('/inventories/latest', async (req, res, next) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 10, 50);
@@ -183,9 +187,6 @@ router.get('/inventories/latest', async (req, res, next) => {
   }
 });
 
-/**
- * GET /inventories/top — топ-5 по количеству items
- */
 router.get('/inventories/top', async (_req, res, next) => {
   try {
     const pipeline = [
@@ -230,9 +231,6 @@ router.get('/inventories/top', async (_req, res, next) => {
   }
 });
 
-/**
- * GET /tags — уникальные теги
- */
 router.get('/tags', async (_req, res, next) => {
   try {
     const pipeline = [
@@ -253,23 +251,36 @@ router.get('/tags', async (_req, res, next) => {
 
 /* ======================================================================
    CRUD: /inventories
-   Храним: owner_id, title, description, image, tags[], category, fields[], customIdFormat, access, stats
    ====================================================================== */
 
-/**
- * GET /inventories
- * Квери: owner=me|<ownerId>, q, tag, category, limit, page
- * Публичный (чтение для всех).
- */
 router.get('/inventories', async (req, res, next) => {
   try {
-    const { owner, q, tag, category, limit = '20', page = '1' } = req.query;
+    const { owner, q, tag, category, limit = '20', page = '1', access } = req.query;
 
     const lim = Math.min(parseInt(limit, 10) || 20, 100);
     const pg = Math.max(parseInt(page, 10) || 1, 1);
 
     const filter = {};
-    if (owner === 'me') {
+
+    // NEW: фильтр по write-доступам
+    if (access === 'write') {
+      try {
+        await new Promise((resolve, reject) =>
+          requireAuth(req, res, (err) => (err ? reject(err) : resolve()))
+        );
+        const uid = toObjectId(req.user?._id) ?? req.user?._id;
+        if (!uid) return res.status(401).json({ error: 'Unauthorized' });
+
+        const rows = await db().collection('inventoryaccesses')
+          .find({ userId: uid, accessType: 'write' }, { projection: { inventoryId: 1 } })
+          .toArray();
+        const invIds = rows.map(r => r.inventoryId).filter(Boolean);
+        if (!invIds.length) return res.json({ page: pg, limit: lim, total: 0, items: [] });
+        filter._id = { $in: invIds };
+      } catch {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    } else if (owner === 'me') {
       // «мягкая» проверка токена
       try {
         await new Promise((resolve, reject) =>
@@ -312,10 +323,6 @@ router.get('/inventories', async (req, res, next) => {
   }
 });
 
-/**
- * GET /inventories/:id
- * Публично: возвращаем полный объект, который ждёт InventoryDetails.jsx.
- */
 router.get('/inventories/:id', async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
@@ -330,11 +337,6 @@ router.get('/inventories/:id', async (req, res, next) => {
   }
 });
 
-/**
- * POST /inventories
- * Требуется JWT. owner_id берём из токена.
- * Принимаем name|title и cover|image; нормализуем в title/image в базе.
- */
 router.post('/inventories', requireAuth, async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -356,7 +358,7 @@ router.post('/inventories', requireAuth, async (req, res, next) => {
       title,
       description,
       category,
-      image, // в базе хранится image; на выдаче -> cover
+      image,
       tags: normalizeTags(tags),
       isPublic,
       fields,
@@ -376,10 +378,6 @@ router.post('/inventories', requireAuth, async (req, res, next) => {
   }
 });
 
-/**
- * PUT /inventories/:id
- * Разрешено владельцу или админу. Поддерживаем алиасы name/cover.
- */
 router.put('/inventories/:id', requireAuth, async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
@@ -391,7 +389,6 @@ router.put('/inventories/:id', requireAuth, async (req, res, next) => {
 
     const $set = { updatedAt: new Date() };
 
-    // основной набор полей
     if ('title' in req.body) $set.title = String(req.body.title || '').trim();
     if ('description' in req.body) $set.description = String(req.body.description || '').trim();
     if ('category' in req.body) $set.category = String(req.body.category || '').trim();
@@ -403,7 +400,6 @@ router.put('/inventories/:id', requireAuth, async (req, res, next) => {
     if ('access' in req.body && typeof req.body.access === 'object') $set.access = req.body.access;
     if ('stats' in req.body && typeof req.body.stats === 'object') $set.stats = req.body.stats;
 
-    // алиасы с фронта
     if ('name' in req.body && !('title' in req.body)) $set.title = String(req.body.name || '').trim();
     if ('cover' in req.body && !('image' in req.body)) $set.image = String(req.body.cover || '').trim();
 
@@ -416,10 +412,6 @@ router.put('/inventories/:id', requireAuth, async (req, res, next) => {
   }
 });
 
-/**
- * DELETE /inventories/:id
- * Разрешено владельцу или админу.
- */
 router.delete('/inventories/:id', requireAuth, async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
@@ -440,10 +432,6 @@ router.delete('/inventories/:id', requireAuth, async (req, res, next) => {
    ШАГ 5: кастомные поля и Custom ID
    ====================================================================== */
 
-/**
- * GET /inventories/:id/fields
- * Публично: вернуть массив полей (для вкладки Fields)
- */
 router.get('/inventories/:id/fields', async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
@@ -461,10 +449,6 @@ router.get('/inventories/:id/fields', async (req, res, next) => {
   }
 });
 
-/**
- * PUT /inventories/:id/fields
- * Требует право редактирования. Body: { fields: FieldDef[] }
- */
 router.put('/inventories/:id/fields', requireAuth, async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
@@ -493,10 +477,6 @@ router.put('/inventories/:id/fields', requireAuth, async (req, res, next) => {
   }
 });
 
-/**
- * GET /inventories/:id/customIdFormat
- * Публично: вернуть текущую схему customIdFormat
- */
 router.get('/inventories/:id/customIdFormat', async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
@@ -514,10 +494,6 @@ router.get('/inventories/:id/customIdFormat', async (req, res, next) => {
   }
 });
 
-/**
- * PUT /inventories/:id/customIdFormat
- * Требует право редактирования. Body: { customIdFormat: {...} }
- */
 router.put('/inventories/:id/customIdFormat', requireAuth, async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
@@ -550,13 +526,6 @@ router.put('/inventories/:id/customIdFormat', requireAuth, async (req, res, next
    DISCUSSION (Chat)
    ====================================================================== */
 
-/**
- * GET /inventories/:id/discussion
- * Публично. Список сообщений по времени (ASC).
- * Query:
- *   - limit: number (default 200, max 500)
- *   - after: ISO date string (optional) — только сообщения с createdAt > after
- */
 router.get('/inventories/:id/discussion', async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
@@ -590,7 +559,6 @@ router.get('/inventories/:id/discussion', async (req, res, next) => {
       }
     ];
 
-    // Коллекция обсуждений: 'discussionposts'
     const posts = await db().collection('discussionposts').aggregate(pipeline).toArray();
     const items = posts.map(p => ({
       id: String(p._id),
@@ -609,10 +577,6 @@ router.get('/inventories/:id/discussion', async (req, res, next) => {
   }
 });
 
-/**
- * POST /inventories/:id/discussion
- * Требует авторизации. Body: { text: string }
- */
 router.post('/inventories/:id/discussion', requireAuth, async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
@@ -643,7 +607,6 @@ router.post('/inventories/:id/discussion', requireAuth, async (req, res, next) =
       },
     };
 
-    // Realtime (если подключён Socket.IO)
     const io = req.app.get('io');
     if (io) {
       io.to(`inv:${String(id)}`).emit('discussion:new', payload);
@@ -656,20 +619,9 @@ router.post('/inventories/:id/discussion', requireAuth, async (req, res, next) =
 });
 
 /* ======================================================================
-   SHAG 9: ACCESS MANAGEMENT (инвентарь ↔ пользователи)
+   SHAG 9: ACCESS MANAGEMENT
    ====================================================================== */
 
-/**
- * Коллекция: inventoryaccesses
- * Документ: { _id, inventoryId:ObjectId, userId:ObjectId, accessType:'read'|'write', createdAt }
- * Индекс (рекомендуется): { inventoryId:1, userId:1 } unique
- */
-
-/**
- * GET /inventories/:id/access
- * Только владелец инвентаря или админ.
- * Возвращает: { owner: {id,name,email,avatar}, items: [{ user:{id,name,email,avatar,blocked}, accessType }] }
- */
 router.get('/inventories/:id/access', requireAuth, async (req, res, next) => {
   try {
     const invId = toObjectId(req.params.id);
@@ -732,18 +684,6 @@ router.get('/inventories/:id/access', requireAuth, async (req, res, next) => {
   }
 });
 
-/**
- * PUT /inventories/:id/access
- * Только владелец или админ.
- * Body:
- * {
- *   "changes": [ { "userId": "<id>|null", "email":"<email>|null", "accessType": "read"|"write"|null } ],
- *   "remove": ["<userId>", ...]
- * }
- * - Если accessType=null => удалить доступ этому пользователю (как remove)
- * - Нельзя менять доступ владельцу.
- * Ответ: такой же, как GET /inventories/:id/access
- */
 router.put('/inventories/:id/access', requireAuth, async (req, res, next) => {
   try {
     const invId = toObjectId(req.params.id);
@@ -753,16 +693,13 @@ router.put('/inventories/:id/access', requireAuth, async (req, res, next) => {
     if (!inv) return res.status(404).json({ error: 'Not found' });
     if (!canEdit(req.user, inv)) return res.status(403).json({ error: 'Forbidden' });
 
-    // Обрабатываем изменения
     const changes = Array.isArray(req.body?.changes) ? req.body.changes : [];
     const remove = Array.isArray(req.body?.remove) ? req.body.remove : [];
 
-    // подготовим индекс уникальности (мягко)
     try {
       await db().collection('inventoryaccesses').createIndex({ inventoryId: 1, userId: 1 }, { unique: true });
     } catch { /* ignore */ }
 
-    // helper: ищем юзера по id/email
     async function resolveUserId(entry) {
       if (entry.userId && mongoose.isValidObjectId(entry.userId)) return new mongoose.Types.ObjectId(entry.userId);
       if (entry.email) {
@@ -772,23 +709,21 @@ router.put('/inventories/:id/access', requireAuth, async (req, res, next) => {
       return null;
     }
 
-    // 1) remove
     const toRemoveIds = [];
     for (const rid of remove) {
       if (!mongoose.isValidObjectId(rid)) continue;
       const oid = new mongoose.Types.ObjectId(rid);
-      if (String(oid) === String(inv.owner_id)) continue; // нельзя убирать владельца
+      if (String(oid) === String(inv.owner_id)) continue;
       toRemoveIds.push(oid);
     }
     if (toRemoveIds.length) {
       await db().collection('inventoryaccesses').deleteMany({ inventoryId: invId, userId: { $in: toRemoveIds } });
     }
 
-    // 2) changes (upsert / unset)
     for (const ch of changes) {
       const uid = await resolveUserId(ch);
       if (!uid) continue;
-      if (String(uid) === String(inv.owner_id)) continue; // владельца не трогаем
+      if (String(uid) === String(inv.owner_id)) continue;
 
       if (!ch.accessType) {
         await db().collection('inventoryaccesses').deleteOne({ inventoryId: invId, userId: uid });
@@ -802,7 +737,6 @@ router.put('/inventories/:id/access', requireAuth, async (req, res, next) => {
       );
     }
 
-    // Возврат — как GET
     req.params.id = String(invId);
     return router.handle({ ...req, method: 'GET', url: `/inventories/${invId}/access` }, res, next);
   } catch (err) {
@@ -811,14 +745,9 @@ router.put('/inventories/:id/access', requireAuth, async (req, res, next) => {
 });
 
 /* ======================================================================
-   USERS SEARCH (для автокомплита в AccessTab)
+   USERS SEARCH (autocomplete)
    ====================================================================== */
 
-/**
- * GET /users/search?q=term&limit=10
- * Требует авторизации. Ищем по email|name (регистронезависимо).
- * Возвращаем: [{ id,name,email,avatar,blocked }]
- */
 router.get('/users/search', requireAuth, async (req, res, next) => {
   try {
     const q = String(req.query.q || '').trim();
@@ -846,13 +775,9 @@ router.get('/users/search', requireAuth, async (req, res, next) => {
 });
 
 /* ======================================================================
-   ADMIN: список пользователей, блокировка, роль админа
+   ADMIN
    ====================================================================== */
 
-/**
- * GET /admin/users?q=&page=&limit=
- * Только админ
- */
 router.get('/admin/users', requireAdmin, async (req, res, next) => {
   try {
     const q = String(req.query.q || '').trim();
@@ -893,10 +818,6 @@ router.get('/admin/users', requireAdmin, async (req, res, next) => {
   }
 });
 
-/**
- * PATCH /admin/users/:id/block { blocked: true|false }
- * Только админ
- */
 router.patch('/admin/users/:id/block', requireAdmin, async (req, res, next) => {
   try {
     const uid = toObjectId(req.params.id);
@@ -920,10 +841,6 @@ router.patch('/admin/users/:id/block', requireAdmin, async (req, res, next) => {
   }
 });
 
-/**
- * PATCH /admin/users/:id/admin { isAdmin: true|false }
- * Только админ
- */
 router.patch('/admin/users/:id/admin', requireAdmin, async (req, res, next) => {
   try {
     const uid = toObjectId(req.params.id);
@@ -932,10 +849,8 @@ router.patch('/admin/users/:id/admin', requireAdmin, async (req, res, next) => {
     const isAdminNext = !!req.body?.isAdmin;
 
     const $set = { isAdmin: isAdminNext };
-    // синхронизируем role для совместимости с canEdit()
     if (isAdminNext) $set.role = 'admin';
     else {
-      // если сейчас role === admin — опускаем до user
       const cur = await db().collection('users').findOne({ _id: uid }, { projection: { role: 1 } });
       if (cur?.role === 'admin') $set.role = 'user';
     }
@@ -952,6 +867,236 @@ router.patch('/admin/users/:id/admin', requireAdmin, async (req, res, next) => {
       isAdmin: !!(u.isAdmin || u.role === 'admin'),
       role: u.role || (u.isAdmin ? 'admin' : 'user')
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ======================================================================
+   ITEMS (лист/создание) + ITEM details (optimistic locking)
+   ====================================================================== */
+
+// Нормализация айтема для клиента
+function itemToClient(doc) {
+  if (!doc) return null;
+  return {
+    _id: String(doc._id),
+    inventoryId: doc.inventoryId ? String(doc.inventoryId) : null,
+    name: doc.name || doc.title || '',
+    description: doc.description || '',
+    image: doc.image || null,
+    tags: Array.isArray(doc.tags) ? doc.tags : [],
+    fields: doc.fields && typeof doc.fields === 'object' ? doc.fields : {},
+    version: typeof doc.version === 'number' ? doc.version : (doc.updatedAt ? new Date(doc.updatedAt).getTime() : 1),
+    createdAt: doc.createdAt || null,
+    updatedAt: doc.updatedAt || null,
+  };
+}
+
+// GET /inventories/:id/items
+router.get('/inventories/:id/items', async (req, res, next) => {
+  try {
+    const invId = toObjectId(req.params.id);
+    if (!invId) return res.status(400).json({ error: 'Invalid id' });
+
+    const { q, limit = '20', page = '1' } = req.query;
+    const lim = Math.min(parseInt(limit, 10) || 20, 100);
+    const pg = Math.max(parseInt(page, 10) || 1, 1);
+
+    const filter = { inventoryId: invId };
+    if (q) {
+      const rx = new RegExp(String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [{ name: rx }, { title: rx }, { description: rx }];
+    }
+
+    const cursor = db().collection('items')
+      .find(filter)
+      .sort({ updatedAt: -1, _id: -1 })
+      .skip((pg - 1) * lim)
+      .limit(lim);
+
+    const [rows, total] = await Promise.all([
+      cursor.toArray(),
+      db().collection('items').countDocuments(filter)
+    ]);
+
+    res.json({
+      page: pg,
+      limit: lim,
+      total,
+      items: rows.map(itemToClient),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /inventories/:id/items
+router.post('/inventories/:id/items', requireAuth, async (req, res, next) => {
+  try {
+    const invId = toObjectId(req.params.id);
+    if (!invId) return res.status(400).json({ error: 'Invalid id' });
+
+    const inv = await db().collection('inventories').findOne({ _id: invId });
+    if (!inv) return res.status(404).json({ error: 'Inventory not found' });
+    if (!(await canWriteInventory(req.user, inv))) return res.status(403).json({ error: 'Forbidden' });
+
+    const body = req.body || {};
+    const name = (body.name ?? body.title ?? '').trim();
+    if (!name) return res.status(400).json({ error: 'Name is required' });
+
+    const itemDoc = {
+      inventoryId: invId,
+      name,
+      description: String(body.description || ''),
+      image: String(body.image || ''),
+      tags: normalizeTags(body.tags),
+      fields: (body.fields && typeof body.fields === 'object') ? body.fields : {},
+      version: 1,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const r = await db().collection('items').insertOne(itemDoc);
+    const saved = await db().collection('items').findOne({ _id: r.insertedId });
+    res.status(201).json(itemToClient(saved));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /items/:itemId
+router.get('/items/:itemId', async (req, res, next) => {
+  try {
+    const itemId = toObjectId(req.params.itemId);
+    if (!itemId) return res.status(400).json({ error: 'Invalid id' });
+    const doc = await db().collection('items').findOne({ _id: itemId });
+    if (!doc) return res.status(404).json({ error: 'Not found' });
+    res.json(itemToClient(doc));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /items/:itemId  (optimistic locking по version)
+router.put('/items/:itemId', requireAuth, async (req, res, next) => {
+  try {
+    const itemId = toObjectId(req.params.itemId);
+    if (!itemId) return res.status(400).json({ error: 'Invalid id' });
+
+    const cur = await db().collection('items').findOne({ _id: itemId }, { projection: { inventoryId: 1, version: 1 } });
+    if (!cur) return res.status(404).json({ error: 'Not found' });
+
+    const inv = await db().collection('inventories').findOne({ _id: cur.inventoryId }, { projection: { owner_id: 1 } });
+    if (!inv) return res.status(404).json({ error: 'Inventory not found' });
+    if (!(await canWriteInventory(req.user, inv))) return res.status(403).json({ error: 'Forbidden' });
+
+    const clientVersion = Number.isInteger(req.body?.version) ? req.body.version : null;
+    if (clientVersion == null) {
+      return res.status(400).json({ error: 'version is required for optimistic locking' });
+    }
+
+    const allowed = {};
+    if ('name' in req.body) allowed.name = String(req.body.name || '');
+    if ('title' in req.body && !('name' in req.body)) allowed.name = String(req.body.title || '');
+    if ('description' in req.body) allowed.description = String(req.body.description || '');
+    if ('image' in req.body) allowed.image = String(req.body.image || '');
+    if ('tags' in req.body) allowed.tags = normalizeTags(req.body.tags);
+    if ('fields' in req.body && typeof req.body.fields === 'object') allowed.fields = req.body.fields;
+
+    allowed.updatedAt = new Date();
+
+    const upd = await db().collection('items').findOneAndUpdate(
+      { _id: itemId, version: clientVersion },
+      { $set: allowed, $inc: { version: 1 } },
+      { returnDocument: 'after' }
+    );
+
+    if (!upd.value) {
+      const fresh = await db().collection('items').findOne({ _id: itemId });
+      return res.status(409).json({ error: 'Version conflict', current: itemToClient(fresh) });
+    }
+
+    res.json(itemToClient(upd.value));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /items/:itemId
+router.delete('/items/:itemId', requireAuth, async (req, res, next) => {
+  try {
+    const itemId = toObjectId(req.params.itemId);
+    if (!itemId) return res.status(400).json({ error: 'Invalid id' });
+
+    const cur = await db().collection('items').findOne({ _id: itemId }, { projection: { inventoryId: 1 } });
+    if (!cur) return res.status(404).json({ error: 'Not found' });
+
+    const inv = await db().collection('inventories').findOne({ _id: cur.inventoryId }, { projection: { owner_id: 1 } });
+    if (!inv) return res.status(404).json({ error: 'Inventory not found' });
+    if (!(await canWriteInventory(req.user, inv))) return res.status(403).json({ error: 'Forbidden' });
+
+    await db().collection('items').deleteOne({ _id: itemId });
+    res.json({ ok: true, _id: String(itemId) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ======================================================================
+   SEARCH (глобальный поиск по инвентарям и айтемам)
+   ====================================================================== */
+
+// Простой фолбэк-поиск regex (если нет text-индексов)
+function buildTextFilter(q, fields) {
+  const rx = new RegExp(String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+  return { $or: fields.map(f => ({ [f]: rx })) };
+}
+
+// GET /search?q=&type=all|inventories|items&limit=&page=
+router.get('/search', async (req, res, next) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const type = (String(req.query.type || 'all').toLowerCase());
+    const lim = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const pg = Math.max(parseInt(req.query.page, 10) || 1, 1);
+
+    if (!q) return res.status(400).json({ error: 'q is required' });
+
+    const wantInv = type === 'all' || type === 'inventories';
+    const wantItems = type === 'all' || type === 'items';
+
+    const out = { q, type, page: pg, limit: lim };
+
+    if (wantInv) {
+      const filterInv = buildTextFilter(q, ['title', 'description', 'name', 'tags']);
+      const [docs, total] = await Promise.all([
+        db().collection('inventories')
+          .find(filterInv, { projection: { title: 1, description: 1, image: 1, tags: 1, updatedAt: 1 } })
+          .sort({ updatedAt: -1, _id: -1 }).skip((pg - 1) * lim).limit(lim).toArray(),
+        db().collection('inventories').countDocuments(filterInv)
+      ]);
+      out.inventories = {
+        total,
+        items: docs.map(toClientLite)
+      };
+    }
+
+    if (wantItems) {
+      const filterIt = buildTextFilter(q, ['name', 'title', 'description', 'tags']);
+      const [docs, total] = await Promise.all([
+        db().collection('items')
+          .find(filterIt, { projection: { name: 1, description: 1, image: 1, tags: 1, inventoryId: 1, updatedAt: 1, version: 1 } })
+          .sort({ updatedAt: -1, _id: -1 }).skip((pg - 1) * lim).limit(lim).toArray(),
+        db().collection('items').countDocuments(filterIt)
+      ]);
+      out.items = {
+        total,
+        items: docs.map(itemToClient)
+      };
+    }
+
+    res.json(out);
   } catch (err) {
     next(err);
   }
