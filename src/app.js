@@ -13,7 +13,7 @@ import inventoriesRoutes from './routes/inventories.js';
 import itemsRoutes from './routes/items.js';
 import likesRoutes from './routes/likes.js';
 
-// ⬇️ ДОБАВЛЕНО: локальный логин по email/паролю
+// Локальный логин email/password
 import authLocalRoutes from './routes/auth-local.js';
 
 const app = express();
@@ -53,12 +53,11 @@ app.get('/favicon.ico', (_req, res) => res.sendStatus(204));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 /**
- * основные роуты
- * порядок важен лишь если где-то совпадают пути/методы;
- * здесь мы специально подключаем локальный логин ДО общего /auth,
- * чтобы POST /auth/login обрабатывался именно нашим email/password обработчиком.
+ * ОСНОВНЫЕ РОУТЫ (корневые)
+ * Важно: /auth/login (email+password) регистрируем ДО общих /auth,
+ * чтобы POST /auth/login обрабатывался нашим локальным обработчиком.
  */
-app.use('/auth', authLocalRoutes); // ← POST /auth/login (email+password)
+app.use('/auth', authLocalRoutes); // POST /auth/login (email+password)
 app.use('/auth', authRoutes);
 app.use('/users', usersRoutes);
 
@@ -67,7 +66,16 @@ app.use('/', inventoriesRoutes); // /inventories, /inventories/:id ...
 app.use('/', itemsRoutes);       // /inventories/:id/items, /items/:itemId
 app.use('/', likesRoutes);       // /items/:itemId/like, /items/:itemId/likes
 
-// Для обратной совместимости — те же роуты под /api
+/**
+ * КОМПАТИБИЛИТИ ПОД /api/*
+ * Если фронт в каком-то окружении шлёт на /api/... — всё тоже работает.
+ */
+app.get('/api', (_req, res) => res.json({ ok: true, name: 'auth-backend', version: '2.0.0' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+app.use('/api/auth', authLocalRoutes); // POST /api/auth/login
+app.use('/api/auth', authRoutes);
+app.use('/api/users', usersRoutes);
 app.use('/api', itemsRoutes);
 app.use('/api', likesRoutes);
 
