@@ -13,6 +13,9 @@ import inventoriesRoutes from './routes/inventories.js';
 import itemsRoutes from './routes/items.js';
 import likesRoutes from './routes/likes.js';
 
+// ⬇️ ДОБАВЛЕНО: локальный логин по email/паролю
+import authLocalRoutes from './routes/auth-local.js';
+
 const app = express();
 const { NODE_ENV } = loadEnv();
 
@@ -49,7 +52,13 @@ app.get('/', (_req, res) => res.json({ ok: true, name: 'auth-backend', version: 
 app.get('/favicon.ico', (_req, res) => res.sendStatus(204));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// основные роуты
+/**
+ * основные роуты
+ * порядок важен лишь если где-то совпадают пути/методы;
+ * здесь мы специально подключаем локальный логин ДО общего /auth,
+ * чтобы POST /auth/login обрабатывался именно нашим email/password обработчиком.
+ */
+app.use('/auth', authLocalRoutes); // ← POST /auth/login (email+password)
 app.use('/auth', authRoutes);
 app.use('/users', usersRoutes);
 
