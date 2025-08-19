@@ -6,6 +6,7 @@ const router = Router();
 
 /**
  * GET /inventories/latest?limit=10
+ * Теперь с автором (owner) через $lookup.
  */
 router.get('/inventories/latest', async (req, res, next) => {
   try {
@@ -17,13 +18,33 @@ router.get('/inventories/latest', async (req, res, next) => {
           sortKey: {
             $ifNull: [
               '$updated_at',
-              { $ifNull: ['$updatedAt', { $ifNull: ['$created_at', '$createdAt'] }] }
-            ]
-          }
-        }
+              { $ifNull: ['$updatedAt', { $ifNull: ['$created_at', '$createdAt'] }] },
+            ],
+          },
+        },
       },
       { $sort: { sortKey: -1, _id: -1 } },
-      { $limit: limit }
+      { $limit: limit },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'owner_id',
+          foreignField: '_id',
+          as: 'ownerUser',
+        },
+      },
+      { $unwind: { path: '$ownerUser', preserveNullAndEmptyArrays: true } },
+      {
+        $addFields: {
+          owner: {
+            id: '$ownerUser._id',
+            name: '$ownerUser.name',
+            email: '$ownerUser.email',
+            avatar: '$ownerUser.avatar',
+          },
+        },
+      },
+      { $project: { ownerUser: 0 } },
     ];
 
     const raw = await db().collection('inventories').aggregate(pipeline).toArray();
@@ -36,14 +57,16 @@ router.get('/inventories/latest', async (req, res, next) => {
 
 /**
  * GET /inventories/top — топ-5 по количеству items
+ * Теперь также возвращаем owner.
  */
 router.get('/inventories/top', async (_req, res, next) => {
   try {
     const pipeline = [
+      // считаем количество items на инвентарь
       {
         $addFields: {
-          invIdRaw: { $ifNull: ['$inventory_id', { $ifNull: ['$inventoryId', '$inventory'] }] }
-        }
+          invIdRaw: { $ifNull: ['$inventory_id', { $ifNull: ['$inventoryId', '$inventory'] }] },
+        },
       },
       {
         $addFields: {
@@ -51,26 +74,63 @@ router.get('/inventories/top', async (_req, res, next) => {
             $cond: [
               { $eq: [{ $type: '$invIdRaw' }, 'string'] },
               { $toObjectId: '$invIdRaw' },
-              '$invIdRaw'
-            ]
-          }
-        }
+              '$invIdRaw',
+            ],
+          },
+        },
       },
       { $match: { invId: { $exists: true, $ne: null } } },
       { $group: { _id: '$invId', itemsCount: { $sum: 1 } } },
       { $sort: { itemsCount: -1 } },
       { $limit: 5 },
+
+      // подтягиваем сам инвентарь
       {
         $lookup: {
           from: 'inventories',
           localField: '_id',
           foreignField: '_id',
-          as: 'inventory'
-        }
+          as: 'inventory',
+        },
       },
       { $unwind: '$inventory' },
+
+      // переносим поля инвентаря в корень
       { $replaceRoot: { newRoot: { $mergeObjects: ['$$ROOT', '$inventory'] } } },
-      { $project: { itemsCount: 1, _id: 1, title: 1, name: 1, description: 1, image: 1, cover: 1, tags: 1, owner_id: 1, createdAt: 1, updatedAt: 1 } }
+
+      // подтягиваем автора
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'owner_id',
+          foreignField: '_id',
+          as: 'ownerUser',
+        },
+      },
+      { $unwind: { path: '$ownerUser', preserveNullAndEmptyArrays: true } },
+
+      // финальная проекция
+      {
+        $project: {
+          itemsCount: 1,
+          _id: 1,
+          title: 1,
+          name: 1,
+          description: 1,
+          image: 1,
+          cover: 1,
+          tags: 1,
+          owner_id: 1,
+          createdAt: 1,
+          updatedAt: 1,
+          owner: {
+            id: '$ownerUser._id',
+            name: '$ownerUser.name',
+            email: '$ownerUser.email',
+            avatar: '$ownerUser.avatar',
+          },
+        },
+      },
     ];
 
     const raw = await db().collection('items').aggregate(pipeline).toArray();
@@ -82,7 +142,7 @@ router.get('/inventories/top', async (_req, res, next) => {
 });
 
 /**
- * GET /tags — уникальные теги
+ * GET /tags — уникальные теги (без изменений)
  */
 router.get('/tags', async (_req, res, next) => {
   try {
@@ -92,7 +152,7 @@ router.get('/tags', async (_req, res, next) => {
       { $addFields: { tagNorm: { $toLower: '$tags' } } },
       { $group: { _id: '$tagNorm' } },
       { $sort: { _id: 1 } },
-      { $project: { _id: 0, tag: '$_id' } }
+      { $project: { _id: 0, tag: '$_id' } },
     ];
 
     const tags = await db().collection('inventories').aggregate(pipeline).toArray();

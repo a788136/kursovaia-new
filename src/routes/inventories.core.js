@@ -1,11 +1,20 @@
 // routes/inventories.core.js
 import { Router } from 'express';
-import { db, toObjectId, normalizeTags, toClientLite, toClientFull, requireAuth, canEdit } from './_shared.js';
+import {
+  db,
+  toObjectId,
+  normalizeTags,
+  toClientLite,
+  toClientFull,
+  requireAuth,
+  canEdit,
+} from './_shared.js';
 
 const router = Router();
 
 /**
  * GET /inventories
+ * Публично. Фильтры сохранены. Добавлен $lookup автора.
  */
 router.get('/inventories', async (req, res, next) => {
   try {
@@ -16,7 +25,7 @@ router.get('/inventories', async (req, res, next) => {
 
     const filter = {};
     if (owner === 'me') {
-      // «мягкая» проверка токена
+      // «мягкая» проверка токена — как у вас было
       try {
         await new Promise((resolve, reject) =>
           requireAuth(req, res, (err) => (err ? reject(err) : resolve()))
@@ -35,21 +44,46 @@ router.get('/inventories', async (req, res, next) => {
     if (tag) filter.tags = String(tag).trim().toLowerCase();
 
     if (q) {
-      const rx = new RegExp(String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const rx = new RegExp(
+        String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+        'i'
+      );
       filter.$or = [{ title: rx }, { description: rx }, { name: rx }];
     }
 
-    const cursor = db()
-      .collection('inventories')
-      .find(filter)
-      .sort({ updatedAt: -1, _id: -1 })
-      .skip((pg - 1) * lim)
-      .limit(lim);
+    // считаем total прежним способом
+    const total = await db().collection('inventories').countDocuments(filter);
 
-    const [docs, total] = await Promise.all([
-      cursor.toArray(),
-      db().collection('inventories').countDocuments(filter)
-    ]);
+    // берём список через aggregate, чтобы подтянуть owner
+    const docs = await db()
+      .collection('inventories')
+      .aggregate([
+        { $match: filter },
+        { $sort: { updatedAt: -1, _id: -1 } },
+        { $skip: (pg - 1) * lim },
+        { $limit: lim },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'owner_id',
+            foreignField: '_id',
+            as: 'ownerUser',
+          },
+        },
+        { $unwind: { path: '$ownerUser', preserveNullAndEmptyArrays: true } },
+        {
+          $addFields: {
+            owner: {
+              id: '$ownerUser._id',
+              name: '$ownerUser.name',
+              email: '$ownerUser.email',
+              avatar: '$ownerUser.avatar',
+            },
+          },
+        },
+        { $project: { ownerUser: 0 } },
+      ])
+      .toArray();
 
     const items = docs.map(toClientLite);
     res.json({ page: pg, limit: lim, total, items });
@@ -60,13 +94,41 @@ router.get('/inventories', async (req, res, next) => {
 
 /**
  * GET /inventories/:id
+ * Публично. Добавлен $lookup автора, затем toClientFull.
  */
 router.get('/inventories/:id', async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
     if (!id) return res.status(400).json({ error: 'Invalid id' });
 
-    const inv = await db().collection('inventories').findOne({ _id: id });
+    const rows = await db()
+      .collection('inventories')
+      .aggregate([
+        { $match: { _id: id } },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'owner_id',
+            foreignField: '_id',
+            as: 'ownerUser',
+          },
+        },
+        { $unwind: { path: '$ownerUser', preserveNullAndEmptyArrays: true } },
+        {
+          $addFields: {
+            owner: {
+              id: '$ownerUser._id',
+              name: '$ownerUser.name',
+              email: '$ownerUser.email',
+              avatar: '$ownerUser.avatar',
+            },
+          },
+        },
+        { $project: { ownerUser: 0 } },
+      ])
+      .toArray();
+
+    const inv = rows[0];
     if (!inv) return res.status(404).json({ error: 'Not found' });
 
     return res.json(toClientFull(inv));
@@ -77,6 +139,7 @@ router.get('/inventories/:id', async (req, res, next) => {
 
 /**
  * POST /inventories
+ * Без изменений по логике. (owner_id из токена)
  */
 router.post('/inventories', requireAuth, async (req, res, next) => {
   try {
@@ -107,12 +170,38 @@ router.post('/inventories', requireAuth, async (req, res, next) => {
       access,
       stats,
       createdAt: new Date(),
-      updatedAt: new Date()
+      updatedAt: new Date(),
     };
 
     const result = await db().collection('inventories').insertOne(doc);
-    const saved = await db().collection('inventories').findOne({ _id: result.insertedId });
+    const savedRows = await db()
+      .collection('inventories')
+      .aggregate([
+        { $match: { _id: result.insertedId } },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'owner_id',
+            foreignField: '_id',
+            as: 'ownerUser',
+          },
+        },
+        { $unwind: { path: '$ownerUser', preserveNullAndEmptyArrays: true } },
+        {
+          $addFields: {
+            owner: {
+              id: '$ownerUser._id',
+              name: '$ownerUser.name',
+              email: '$ownerUser.email',
+              avatar: '$ownerUser.avatar',
+            },
+          },
+        },
+        { $project: { ownerUser: 0 } },
+      ])
+      .toArray();
 
+    const saved = savedRows[0];
     return res.status(201).json(toClientFull(saved));
   } catch (err) {
     next(err);
@@ -121,6 +210,7 @@ router.post('/inventories', requireAuth, async (req, res, next) => {
 
 /**
  * PUT /inventories/:id
+ * Логика сохранена, только отдаём ответ в том же виде (с owner).
  */
 router.put('/inventories/:id', requireAuth, async (req, res, next) => {
   try {
@@ -151,7 +241,35 @@ router.put('/inventories/:id', requireAuth, async (req, res, next) => {
 
     await db().collection('inventories').updateOne({ _id: id }, { $set });
 
-    const updated = await db().collection('inventories').findOne({ _id: id });
+    // возвращаем с owner
+    const updatedRows = await db()
+      .collection('inventories')
+      .aggregate([
+        { $match: { _id: id } },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'owner_id',
+            foreignField: '_id',
+            as: 'ownerUser',
+          },
+        },
+        { $unwind: { path: '$ownerUser', preserveNullAndEmptyArrays: true } },
+        {
+          $addFields: {
+            owner: {
+              id: '$ownerUser._id',
+              name: '$ownerUser.name',
+              email: '$ownerUser.email',
+              avatar: '$ownerUser.avatar',
+            },
+          },
+        },
+        { $project: { ownerUser: 0 } },
+      ])
+      .toArray();
+
+    const updated = updatedRows[0];
     return res.json(toClientFull(updated));
   } catch (err) {
     next(err);
@@ -160,6 +278,7 @@ router.put('/inventories/:id', requireAuth, async (req, res, next) => {
 
 /**
  * DELETE /inventories/:id
+ * Без изменений.
  */
 router.delete('/inventories/:id', requireAuth, async (req, res, next) => {
   try {
