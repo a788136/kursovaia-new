@@ -1,3 +1,4 @@
+// routes/auth.js
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { User } from '../models/User.js';
@@ -36,7 +37,14 @@ router.get('/me', attachUser, async (req, res) => {
   const user = await User.findById(req.jwt.sub).exec();
   if (!user) return res.json({ authenticated: false });
   if ((user.tokenVersion || 0) !== (req.jwt.tv || 0)) return res.json({ authenticated: false });
-  res.json({ authenticated: true, user: user.toClient() });
+
+  const base = user.toClient();
+  // глобальная роль + список ролей для UI
+  const role = (user.role === 'admin' || user.isAdmin) ? 'admin' : (user.role || 'user');
+  const roles = ['authenticated'];
+  if (role === 'admin') roles.push('admins');
+
+  res.json({ authenticated: true, user: { ...base, role, roles } });
 });
 
 /* ===== Google ===== */

@@ -9,6 +9,7 @@ export function toObjectId(id) {
   if (typeof id === 'string' && mongoose.isValidObjectId(id)) {
     return new mongoose.Types.ObjectId(id);
   }
+  if (id instanceof mongoose.Types.ObjectId) return id;
   return null;
 }
 
@@ -150,4 +151,51 @@ export function validateCustomIdFormat(cfg) {
 export function buildTextFilter(q, fields) {
   const rx = new RegExp(String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
   return { $or: fields.map((f) => ({ [f]: rx })) };
+}
+
+/* ====== РОЛИ ПОЛЬЗОВАТЕЛЯ В КОНТЕКСТЕ ИНВЕНТАРИЗАЦИИ ====== */
+/**
+ * Возвращает массив ролей пользователя относительно инвентаризации:
+ * - 'non-authenticated' | 'authenticated'
+ * - 'admins' (если user.isAdmin || user.role === 'admin')
+ * - 'creators' (если user владелец инвентаризации)
+ * - 'write-access' (если есть запись в inventoryaccesses с accessType='write')
+ */
+export async function getInventoryRoles(user, invLike) {
+  try {
+    if (!user) return ['non-authenticated'];
+
+    const roles = ['authenticated'];
+    if (user.isAdmin || user.role === 'admin') roles.push('admins');
+
+    // Определяем invId и ownerId
+    const invId =
+      (invLike && invLike._id && toObjectId(invLike._id)) ||
+      (typeof invLike === 'string' && toObjectId(invLike)) ||
+      null;
+
+    const ownerRaw =
+      invLike?.owner_id ??
+      (invLike?.owner && (invLike.owner._id || invLike.owner.id)) ??
+      null;
+
+    const userIdStr = String(user._id ?? user.id ?? '');
+    if (ownerRaw && String(ownerRaw) === userIdStr) roles.push('creators');
+
+    if (invId) {
+      const uid = toObjectId(userIdStr);
+      if (uid) {
+        const rec = await db()
+          .collection('inventoryaccesses')
+          .findOne({ inventoryId: invId, userId: uid });
+        if (rec && String(rec.accessType || '').toLowerCase() === 'write') {
+          roles.push('write-access');
+        }
+      }
+    }
+
+    return roles;
+  } catch {
+    return user ? ['authenticated'] : ['non-authenticated'];
+  }
 }

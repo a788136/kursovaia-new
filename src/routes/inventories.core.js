@@ -8,7 +8,9 @@ import {
   toClientFull,
   requireAuth,
   canEdit,
+  getInventoryRoles,
 } from './_shared.js';
+import { attachUser } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -25,7 +27,7 @@ router.get('/inventories', async (req, res, next) => {
 
     const filter = {};
     if (owner === 'me') {
-      // «мягкая» проверка токена — как у вас было
+      // «мягкая» проверка токена — как у тебя было
       try {
         await new Promise((resolve, reject) =>
           requireAuth(req, res, (err) => (err ? reject(err) : resolve()))
@@ -51,10 +53,8 @@ router.get('/inventories', async (req, res, next) => {
       filter.$or = [{ title: rx }, { description: rx }, { name: rx }];
     }
 
-    // считаем total прежним способом
     const total = await db().collection('inventories').countDocuments(filter);
 
-    // берём список через aggregate, чтобы подтянуть owner
     const docs = await db()
       .collection('inventories')
       .aggregate([
@@ -95,8 +95,9 @@ router.get('/inventories', async (req, res, next) => {
 /**
  * GET /inventories/:id
  * Публично. Добавлен $lookup автора, затем toClientFull.
+ * ДОБАВЛЕНО: attachUser + userRoles (Non-authenticated/Authenticated/Creators/Write-access/Admins)
  */
-router.get('/inventories/:id', async (req, res, next) => {
+router.get('/inventories/:id', attachUser, async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
     if (!id) return res.status(400).json({ error: 'Invalid id' });
@@ -131,7 +132,16 @@ router.get('/inventories/:id', async (req, res, next) => {
     const inv = rows[0];
     if (!inv) return res.status(404).json({ error: 'Not found' });
 
-    return res.json(toClientFull(inv));
+    const payload = toClientFull(inv);
+
+    // Подготовим роли пользователя относительно этой инвентаризации
+    let authedUser = null;
+    if (req.user) {
+      authedUser = req.user; // attachUser уже положил пользователя если токен валиден
+    }
+    payload.userRoles = await getInventoryRoles(authedUser, inv);
+
+    return res.json(payload);
   } catch (err) {
     next(err);
   }
