@@ -12,16 +12,12 @@ import {
 
 const router = Router();
 
-/**
- * ВСПОМОГАТЕЛЬНО: собираем $or для проверки доступа пользователя к инвентаризации.
- * - owner_id → пишущие права
- * - access как объект-карта: access.<userId> in ['write', true, 1, 2]
- * - access как массив: access[] или access.users[] со структурами { userId/user_id/id, accessType }
- */
-function buildAccessOr(uid) {
+/* ---------- ВСПОМОГАТЕЛЬНО: правила доступа ---------- */
+function buildAccessWriteOr(uid) {
   const or = [];
   const uidStr = String(uid);
-  // владелец — всегда write-права
+
+  // владелец = всегда write
   or.push({ owner_id: toObjectId(uidStr) ?? uidStr });
 
   // форма "map": access.<userId> = 'write' | true | 1 | 2
@@ -31,27 +27,20 @@ function buildAccessOr(uid) {
   or.push({ [`access.${uidStr}`]: 2 });
 
   // форма "array": access: [{ userId/user_id/id, accessType }]
-  const keys = ['userId', 'user_id', 'id'];
-  for (const k of keys) {
+  for (const k of ['userId', 'user_id', 'id']) {
     or.push({ access: { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'write' } } });
     or.push({ 'access.users': { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'write' } } });
   }
   return or;
 }
 
-/**
- * ВСПОМОГАТЕЛЬНО: собираем $or для READ-доступа (owner → write, write → тоже read).
- */
 function buildAccessReadOr(uid) {
-  const or = buildAccessOr(uid); // уже включает owner & write
+  const or = buildAccessWriteOr(uid); // write включает owner
   const uidStr = String(uid);
 
-  // формы "map" для read
+  // дополнительно read
   or.push({ [`access.${uidStr}`]: 'read' });
-
-  // формы "array" для read
-  const keys = ['userId', 'user_id', 'id'];
-  for (const k of keys) {
+  for (const k of ['userId', 'user_id', 'id']) {
     or.push({ access: { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'read' } } });
     or.push({ 'access.users': { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'read' } } });
   }
@@ -60,10 +49,12 @@ function buildAccessReadOr(uid) {
 
 /**
  * GET /inventories
- * Публично. Фильтры сохранены. Добавлены:
- * - ?owner=me (как было)
- * - ?access=write|read — требует JWT; возвращает только инвентаризации, к которым есть доступ.
- * Плюс $lookup автора.
+ * Параметры:
+ * - owner=me | <userId>
+ * - access=write|read (JWT обязателен)
+ * - q / tag / category
+ * - page / limit
+ * Всегда подтягиваем автора ($lookup), форматируем через toClientLite.
  */
 router.get('/inventories', async (req, res, next) => {
   try {
@@ -73,7 +64,8 @@ router.get('/inventories', async (req, res, next) => {
     const pg = Math.max(parseInt(page, 10) || 1, 1);
 
     const filter = {};
-    // owner
+
+    // --- owner ---
     if (owner === 'me') {
       try {
         await new Promise((resolve, reject) =>
@@ -89,7 +81,7 @@ router.get('/inventories', async (req, res, next) => {
       filter.owner_id = toObjectId(owner) ?? owner;
     }
 
-    // category / tag / q
+    // --- category / tag / q ---
     if (category) filter.category = String(category).trim();
     if (tag) filter.tags = String(tag).trim().toLowerCase();
     if (q) {
@@ -97,9 +89,8 @@ router.get('/inventories', async (req, res, next) => {
       filter.$or = [{ title: rx }, { description: rx }, { name: rx }];
     }
 
-    // access filter (write|read)
+    // --- access ---
     if (access === 'write' || access === 'read') {
-      // мягкий requireAuth — как и в owner=me
       try {
         await new Promise((resolve, reject) =>
           requireAuth(req, res, (err) => (err ? reject(err) : resolve()))
@@ -107,25 +98,23 @@ router.get('/inventories', async (req, res, next) => {
         const uid = req.user?._id;
         if (!uid) return res.status(401).json({ error: 'Unauthorized' });
 
-        const or = access === 'write' ? buildAccessOr(uid) : buildAccessReadOr(uid);
-        // Накладываем поверх остальных фильтров
+        const aclOr = access === 'write' ? buildAccessWriteOr(uid) : buildAccessReadOr(uid);
+
+        // накладываем с остальными фильтрами
         if (filter.$or) {
-          // уже есть $or от q — перенесём в $and
           const prevOr = filter.$or;
           delete filter.$or;
-          filter.$and = [...(filter.$and || []), { $or: prevOr }, { $or: or }];
+          filter.$and = [...(filter.$and || []), { $or: prevOr }, { $or: aclOr }];
         } else {
-          filter.$and = [...(filter.$and || []), { $or: or }];
+          filter.$and = [...(filter.$and || []), { $or: aclOr }];
         }
       } catch {
         return res.status(401).json({ error: 'Unauthorized' });
       }
     }
 
-    // считаем total прежним способом
     const total = await db().collection('inventories').countDocuments(filter);
 
-    // берём список через aggregate, чтобы подтянуть owner
     const docs = await db()
       .collection('inventories')
       .aggregate([
@@ -165,7 +154,7 @@ router.get('/inventories', async (req, res, next) => {
 
 /**
  * GET /inventories/:id
- * Публично. Добавлен $lookup автора, затем toClientFull.
+ * Публично; $lookup автора.
  */
 router.get('/inventories/:id', async (req, res, next) => {
   try {
@@ -210,7 +199,6 @@ router.get('/inventories/:id', async (req, res, next) => {
 
 /**
  * POST /inventories
- * Без изменений по логике. (owner_id из токена)
  */
 router.post('/inventories', requireAuth, async (req, res, next) => {
   try {
@@ -245,6 +233,7 @@ router.post('/inventories', requireAuth, async (req, res, next) => {
     };
 
     const result = await db().collection('inventories').insertOne(doc);
+
     const savedRows = await db()
       .collection('inventories')
       .aggregate([
@@ -281,7 +270,6 @@ router.post('/inventories', requireAuth, async (req, res, next) => {
 
 /**
  * PUT /inventories/:id
- * Логика сохранена, только отдаём ответ в том же виде (с owner).
  */
 router.put('/inventories/:id', requireAuth, async (req, res, next) => {
   try {
@@ -346,7 +334,6 @@ router.put('/inventories/:id', requireAuth, async (req, res, next) => {
 
 /**
  * DELETE /inventories/:id
- * Без изменений.
  */
 router.delete('/inventories/:id', requireAuth, async (req, res, next) => {
   try {
