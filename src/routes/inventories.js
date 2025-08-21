@@ -12,8 +12,6 @@ import userSearch from './users.search.js';
 import admin from './admin.js';
 import search from './search.js';
 
-// ⬇️ ДОБАВЛЕНО: роут со списком моих доступов
-import accessMy from './access.my.js';
 
 // Единый роутер, чтобы app.js не менять
 const router = Router();
@@ -26,8 +24,5 @@ router.use(access);
 router.use(userSearch);
 router.use(admin);
 router.use(search);
-
-// ⬇️ ДОБАВЛЕНО: подключаем /access/my
-router.use(accessMy);
 
 export default router;
