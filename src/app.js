@@ -16,6 +16,8 @@ import likesRoutes from './routes/likes.js';
 // Локальный логин email/password
 import authLocalRoutes from './routes/auth-local.js';
 
+import accessMyRouter from './routes/access.my.js';
+
 const app = express();
 const { NODE_ENV } = loadEnv();
 
@@ -78,6 +80,8 @@ app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api', itemsRoutes);
 app.use('/api', likesRoutes);
+
+app.use('/api', accessMyRouter); 
 
 // универсальный обработчик ошибок
 app.use((err, _req, res, _next) => {

@@ -12,6 +12,7 @@ import userSearch from './users.search.js';
 import admin from './admin.js';
 import search from './search.js';
 
+
 // Единый роутер, чтобы app.js не менять
 const router = Router();
 router.use(home);

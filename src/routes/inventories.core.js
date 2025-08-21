@@ -8,26 +8,73 @@ import {
   toClientFull,
   requireAuth,
   canEdit,
-  getInventoryRoles,
 } from './_shared.js';
-import { attachUser } from '../middleware/auth.js';
 
 const router = Router();
 
 /**
+ * ВСПОМОГАТЕЛЬНО: собираем $or для проверки доступа пользователя к инвентаризации.
+ * - owner_id → пишущие права
+ * - access как объект-карта: access.<userId> in ['write', true, 1, 2]
+ * - access как массив: access[] или access.users[] со структурами { userId/user_id/id, accessType }
+ */
+function buildAccessOr(uid) {
+  const or = [];
+  const uidStr = String(uid);
+  // владелец — всегда write-права
+  or.push({ owner_id: toObjectId(uidStr) ?? uidStr });
+
+  // форма "map": access.<userId> = 'write' | true | 1 | 2
+  or.push({ [`access.${uidStr}`]: 'write' });
+  or.push({ [`access.${uidStr}`]: true });
+  or.push({ [`access.${uidStr}`]: 1 });
+  or.push({ [`access.${uidStr}`]: 2 });
+
+  // форма "array": access: [{ userId/user_id/id, accessType }]
+  const keys = ['userId', 'user_id', 'id'];
+  for (const k of keys) {
+    or.push({ access: { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'write' } } });
+    or.push({ 'access.users': { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'write' } } });
+  }
+  return or;
+}
+
+/**
+ * ВСПОМОГАТЕЛЬНО: собираем $or для READ-доступа (owner → write, write → тоже read).
+ */
+function buildAccessReadOr(uid) {
+  const or = buildAccessOr(uid); // уже включает owner & write
+  const uidStr = String(uid);
+
+  // формы "map" для read
+  or.push({ [`access.${uidStr}`]: 'read' });
+
+  // формы "array" для read
+  const keys = ['userId', 'user_id', 'id'];
+  for (const k of keys) {
+    or.push({ access: { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'read' } } });
+    or.push({ 'access.users': { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'read' } } });
+  }
+  return or;
+}
+
+/**
  * GET /inventories
- * Публично. Фильтры сохранены. Добавлен $lookup автора.
+ * Публично. Фильтры сохранены. Добавлены:
+ * - ?owner=me (как было)
+ * - ?access=write|read — требует JWT; возвращает только инвентаризации, к которым есть доступ.
+ * Плюс $lookup автора.
  */
 router.get('/inventories', async (req, res, next) => {
   try {
-    const { owner, q, tag, category, limit = '20', page = '1' } = req.query;
+    const { owner, q, tag, category, access, limit = '20', page = '1' } = req.query;
 
     const lim = Math.min(parseInt(limit, 10) || 20, 100);
     const pg = Math.max(parseInt(page, 10) || 1, 1);
 
     const filter = {};
+    // owner
     if (owner === 'me') {
-      // «мягкая» проверка токена — как у тебя было
       try {
         await new Promise((resolve, reject) =>
           requireAuth(req, res, (err) => (err ? reject(err) : resolve()))
@@ -42,19 +89,43 @@ router.get('/inventories', async (req, res, next) => {
       filter.owner_id = toObjectId(owner) ?? owner;
     }
 
+    // category / tag / q
     if (category) filter.category = String(category).trim();
     if (tag) filter.tags = String(tag).trim().toLowerCase();
-
     if (q) {
-      const rx = new RegExp(
-        String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-        'i'
-      );
+      const rx = new RegExp(String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       filter.$or = [{ title: rx }, { description: rx }, { name: rx }];
     }
 
+    // access filter (write|read)
+    if (access === 'write' || access === 'read') {
+      // мягкий requireAuth — как и в owner=me
+      try {
+        await new Promise((resolve, reject) =>
+          requireAuth(req, res, (err) => (err ? reject(err) : resolve()))
+        );
+        const uid = req.user?._id;
+        if (!uid) return res.status(401).json({ error: 'Unauthorized' });
+
+        const or = access === 'write' ? buildAccessOr(uid) : buildAccessReadOr(uid);
+        // Накладываем поверх остальных фильтров
+        if (filter.$or) {
+          // уже есть $or от q — перенесём в $and
+          const prevOr = filter.$or;
+          delete filter.$or;
+          filter.$and = [...(filter.$and || []), { $or: prevOr }, { $or: or }];
+        } else {
+          filter.$and = [...(filter.$and || []), { $or: or }];
+        }
+      } catch {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    }
+
+    // считаем total прежним способом
     const total = await db().collection('inventories').countDocuments(filter);
 
+    // берём список через aggregate, чтобы подтянуть owner
     const docs = await db()
       .collection('inventories')
       .aggregate([
@@ -95,9 +166,8 @@ router.get('/inventories', async (req, res, next) => {
 /**
  * GET /inventories/:id
  * Публично. Добавлен $lookup автора, затем toClientFull.
- * ДОБАВЛЕНО: attachUser + userRoles (Non-authenticated/Authenticated/Creators/Write-access/Admins)
  */
-router.get('/inventories/:id', attachUser, async (req, res, next) => {
+router.get('/inventories/:id', async (req, res, next) => {
   try {
     const id = toObjectId(req.params.id);
     if (!id) return res.status(400).json({ error: 'Invalid id' });
@@ -132,16 +202,7 @@ router.get('/inventories/:id', attachUser, async (req, res, next) => {
     const inv = rows[0];
     if (!inv) return res.status(404).json({ error: 'Not found' });
 
-    const payload = toClientFull(inv);
-
-    // Подготовим роли пользователя относительно этой инвентаризации
-    let authedUser = null;
-    if (req.user) {
-      authedUser = req.user; // attachUser уже положил пользователя если токен валиден
-    }
-    payload.userRoles = await getInventoryRoles(authedUser, inv);
-
-    return res.json(payload);
+    return res.json(toClientFull(inv));
   } catch (err) {
     next(err);
   }
@@ -233,7 +294,6 @@ router.put('/inventories/:id', requireAuth, async (req, res, next) => {
 
     const $set = { updatedAt: new Date() };
 
-    // основной набор полей
     if ('title' in req.body) $set.title = String(req.body.title || '').trim();
     if ('description' in req.body) $set.description = String(req.body.description || '').trim();
     if ('category' in req.body) $set.category = String(req.body.category || '').trim();
@@ -245,13 +305,11 @@ router.put('/inventories/:id', requireAuth, async (req, res, next) => {
     if ('access' in req.body && typeof req.body.access === 'object') $set.access = req.body.access;
     if ('stats' in req.body && typeof req.body.stats === 'object') $set.stats = req.body.stats;
 
-    // алиасы с фронта
     if ('name' in req.body && !('title' in req.body)) $set.title = String(req.body.name || '').trim();
     if ('cover' in req.body && !('image' in req.body)) $set.image = String(req.body.cover || '').trim();
 
     await db().collection('inventories').updateOne({ _id: id }, { $set });
 
-    // возвращаем с owner
     const updatedRows = await db()
       .collection('inventories')
       .aggregate([
