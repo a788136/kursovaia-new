@@ -63,11 +63,13 @@ function buildAccessReadOr(uid) {
  * Публично. Фильтры сохранены. Добавлены:
  * - ?owner=me (как было)
  * - ?access=write|read — требует JWT; возвращает только инвентаризации, к которым есть доступ.
+ * - ?excludeOwner=true — (НОВОЕ) в сочетании с access=*, исключает инвентаризации, где user является владельцем
  * Плюс $lookup автора.
  */
 router.get('/inventories', async (req, res, next) => {
   try {
     const { owner, q, tag, category, access, limit = '20', page = '1' } = req.query;
+    const excludeOwner = String(req.query.excludeOwner || 'false') === 'true';
 
     const lim = Math.min(parseInt(limit, 10) || 20, 100);
     const pg = Math.max(parseInt(page, 10) || 1, 1);
@@ -105,9 +107,12 @@ router.get('/inventories', async (req, res, next) => {
           requireAuth(req, res, (err) => (err ? reject(err) : resolve()))
         );
         const uid = req.user?._id;
+        const uidStr = String(uid);
+        const uidObj = toObjectId(uidStr) ?? uidStr;
         if (!uid) return res.status(401).json({ error: 'Unauthorized' });
 
         const or = access === 'write' ? buildAccessOr(uid) : buildAccessReadOr(uid);
+
         // Накладываем поверх остальных фильтров
         if (filter.$or) {
           // уже есть $or от q — перенесём в $and
@@ -116,6 +121,11 @@ router.get('/inventories', async (req, res, next) => {
           filter.$and = [...(filter.$and || []), { $or: prevOr }, { $or: or }];
         } else {
           filter.$and = [...(filter.$and || []), { $or: or }];
+        }
+
+        // (НОВОЕ) excludeOwner=true → исключаем инвентари, где пользователь владелец
+        if (excludeOwner) {
+          filter.$and.push({ owner_id: { $ne: uidObj } });
         }
       } catch {
         return res.status(401).json({ error: 'Unauthorized' });

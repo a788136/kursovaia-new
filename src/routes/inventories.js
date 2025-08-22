@@ -11,7 +11,7 @@ import access from './inventories.access.js';
 import userSearch from './users.search.js';
 import admin from './admin.js';
 import search from './search.js';
-import accessMy from './access.my.js'; // ⬅️ добавлено
+import accessMy from './access.my.js'; // важно: подключён
 
 // Единый роутер, чтобы app.js не менять
 const router = Router();
@@ -24,6 +24,6 @@ router.use(access);
 router.use(userSearch);
 router.use(admin);
 router.use(search);
-router.use(accessMy); // ⬅️ добавлено
+router.use(accessMy); // <- эндпойнт /access/my
 
 export default router;

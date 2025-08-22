@@ -5,28 +5,32 @@ import { db, toObjectId, toClientLite, requireAuth } from './_shared.js';
 const router = Router();
 
 /**
- * GET /access/my?type=write|read
+ * GET /access/my?type=write|read[&excludeOwner=true]
  * Требует JWT. Возвращает { items: [{ inventory, accessType }] }
- * Владельца считаем как write.
+ * Раньше владельца считали как write; теперь можно опционально исключить владельца.
  */
 router.get('/access/my', requireAuth, async (req, res, next) => {
   try {
     const type = String(req.query.type || 'write').toLowerCase();
+    const excludeOwner = String(req.query.excludeOwner || 'false') === 'true';
     const uid = req.user?._id;
     const uidStr = String(uid);
+    const uidObj = toObjectId(uidStr) ?? uidStr;
 
     // Подбираем фильтр по типу доступа
     const writeOr = (() => {
-      // Используем ту же логику, что и /inventories?access=write
       const or = [];
-      or.push({ owner_id: toObjectId(uidStr) ?? uidStr });
+      // Владелец — write (но можем исключить на этапе $and)
+      or.push({ owner_id: uidObj });
+      // map
       or.push({ [`access.${uidStr}`]: 'write' });
       or.push({ [`access.${uidStr}`]: true });
       or.push({ [`access.${uidStr}`]: 1 });
       or.push({ [`access.${uidStr}`]: 2 });
+      // arrays
       for (const k of ['userId', 'user_id', 'id']) {
-        or.push({ access: { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'write' } } });
-        or.push({ 'access.users': { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'write' } } });
+        or.push({ access: { $elemMatch: { [k]: uidObj, accessType: 'write' } } });
+        or.push({ 'access.users': { $elemMatch: { [k]: uidObj, accessType: 'write' } } });
       }
       return or;
     })();
@@ -35,13 +39,16 @@ router.get('/access/my', requireAuth, async (req, res, next) => {
       const or = [...writeOr];
       or.push({ [`access.${uidStr}`]: 'read' });
       for (const k of ['userId', 'user_id', 'id']) {
-        or.push({ access: { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'read' } } });
-        or.push({ 'access.users': { $elemMatch: { [k]: toObjectId(uidStr) ?? uidStr, accessType: 'read' } } });
+        or.push({ access: { $elemMatch: { [k]: uidObj, accessType: 'read' } } });
+        or.push({ 'access.users': { $elemMatch: { [k]: uidObj, accessType: 'read' } } });
       }
       return or;
     })();
 
-    const filter = { $or: type === 'read' ? readOr : writeOr };
+    const base = { $or: type === 'read' ? readOr : writeOr };
+    const filter = excludeOwner
+      ? { $and: [ base, { owner_id: { $ne: uidObj } } ] }
+      : base;
 
     const docs = await db()
       .collection('inventories')
@@ -56,7 +63,7 @@ router.get('/access/my', requireAuth, async (req, res, next) => {
       .toArray();
 
     const items = docs.map((inv) => {
-      // вычислим accessType для ответа
+      // вычислим accessType для ответа (оставлено как было)
       let accessType = 'read';
       if (String(inv.owner_id) === uidStr) {
         accessType = 'write';
