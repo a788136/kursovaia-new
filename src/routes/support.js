@@ -7,8 +7,7 @@ const router = Router();
 /**
  * POST /support/tickets
  * Body: { summary: string, priority: 'High'|'Average'|'Low', link?: string, template?: string }
- * Env: SUPPORT_ADMIN_EMAILS, APP_NAME
- * Uses upload service: src/services/upload/index.js (Dropbox-only версия)
+ * Returns: { ok, file: { provider, id, path, url? }, payload }
  */
 router.post('/support/tickets', optionalAuth, async (req, res, next) => {
   try {
@@ -16,7 +15,6 @@ router.post('/support/tickets', optionalAuth, async (req, res, next) => {
     if (!summary || !priority) {
       return res.status(400).json({ error: 'summary and priority are required' });
     }
-
     const adminsStr = process.env.SUPPORT_ADMIN_EMAILS || '';
     const admins = adminsStr.split(',').map(s => s.trim()).filter(Boolean);
 
