@@ -1,6 +1,7 @@
 // routes/inventories.js
 import { Router } from 'express';
 
+
 // Подроутеры
 import home from './inventories.home.js';
 import core from './inventories.core.js';
@@ -12,6 +13,7 @@ import userSearch from './users.search.js';
 import admin from './admin.js';
 import search from './search.js';
 import accessMy from './access.my.js'; // важно: подключён
+import support from './support.js';
 
 // Единый роутер, чтобы app.js не менять
 const router = Router();
@@ -25,5 +27,6 @@ router.use(userSearch);
 router.use(admin);
 router.use(search);
 router.use(accessMy); // <- эндпойнт /access/my
+router.use(support);
 
 export default router;
